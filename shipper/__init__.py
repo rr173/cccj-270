@@ -3,11 +3,14 @@
 from .accounting import ByteLedger, TicketIndex
 from .errors import (CheckpointCorrupt, EventError, GroupGone, JobError,
                      JobExists, JobMismatch, JobNotFound, LinkDown,
-                     ProtocolError, ShipperError, SourceError, UnknownGroup)
+                     MigrationError, ProtocolError, ShipperError, SourceError,
+                     UnknownGroup)
 from .events import (DEFAULT_WINDOW, EventRollup, EventWindow, parse_event,
                      window_bounds, window_of)
 from .feed import FeedWriter, FileSource
 from .job import Job, JobStore
+from .migrate import Migration, MigrationResult, migrate, parse_account
+from .migrate_plan import iter_snapshot
 from .session import (FINISH_END, FINISH_ERROR, FINISH_PENDING, FINISH_RUNNING,
                       Group, Session)
 from .source import MockSource, Spec, SyntheticLink, stream, uniform_specs
@@ -24,4 +27,6 @@ __all__ = [
     "SourceError", "SourceLink", "SourceStore", "Spec", "SyntheticLink",
     "TicketIndex", "UnknownGroup", "parse_event", "stream",
     "uniform_specs", "window_bounds", "window_of",
+    "Migration", "MigrationError", "MigrationResult", "iter_snapshot",
+    "migrate", "parse_account",
 ]

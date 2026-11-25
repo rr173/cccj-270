@@ -213,7 +213,90 @@ by scanning the feed file itself, and asserts the recovered rollup equals that
 per-group recomputation after the process restarts.
 
 
+## Account-alias snapshot migration
+
+The shipper also carries the account table itself: the old warehouse delivers
+a *full snapshot* — every account and its aliases — as one `FileSource` feed.
+Downstream cannot stop while a new snapshot is swapped in, so
+`shipper.migrate` turns two snapshots into a change file that can be imported
+batch by batch, keeping **every alias on at most one account after each
+committed batch**.
+
+Each snapshot record is one JSON object:
+
+```json
+{"id": "acct-7", "aliases": ["teal", "rose"]}
+```
+
+`id` is a non-empty string; `aliases` is an array of non-empty strings (it may
+be empty). Ids compare by exact text, an alias array is a *set* (order is
+irrelevant), ids may repeat in neither snapshot and no alias may be claimed by
+two accounts. Feed sequence numbers and categories are not part of the
+reconciliation.
+
+```python
+from shipper import Migration, MigrationError, migrate
+
+result = migrate("old.bin", "new.bin", "changes.jsonl", max_ops=1000)
+print(result.batches, result.ops, result.creates, result.updates,
+      result.deletes)
+
+# or stream batches, with no output file at all
+for batch_no, ops in Migration("old.bin", "new.bin").batches(max_ops=1000):
+    apply_atomically(batch_no, ops)
+```
+
+**Output.** JSON Lines; each line is one atomic batch:
+
+```json
+{"batch":1,"ops":[{"op":"upsert","id":"acct-7","aliases":["a","b"]},
+                  {"op":"delete","id":"acct-9"}]}
+```
+
+| field | meaning |
+|---|---|
+| `batch` | 1-based batch number; apply in ascending order (independent batches may go in any order, but the numbering is a safe one) |
+| `ops` | this batch's operations, all-or-nothing |
+| `ops[].op` | `"upsert"` or `"delete"` |
+| `ops[].id` | the account id, exactly as in the snapshots |
+| `ops[].aliases` | on `"upsert"`: the account's complete new alias set, sorted — a replacement, never a delta |
+
+An account appears in **at most one** operation in the whole file. Unchanged
+accounts are not emitted. Each batch holds at most `max_ops` operations.
+
+**Why some accounts share a batch.** An `upsert`/`delete` is atomic for one
+account, so most changes are one operation each. But if alias `a` moves from
+`X` to `Y`, dropping `a` from `X` must be committed no later than adding it
+to `Y` — otherwise the boundary batch leaves `a` on both. Those hand-offs
+form a graph, and each strongly connected component must be one atomic batch.
+A component larger than `max_ops` cannot be handed over within the limit and
+`MigrationError` is raised — never a file with a temporary account or an
+intermediate alias.
+
+**Failure and atomicity.** A truncated/unreadable feed, an invalid record
+(bad JSON, missing/extra/duplicate key, wrong type, empty id/alias, a repeated
+id or alias, or one alias on two accounts) raises `MigrationError` naming the
+record. Output is staged next to the destination, fsynced and renamed only
+when complete, so a failure publishes nothing and leaves any earlier good
+output untouched.
+
+**Memory.** Both snapshots are staged in a private SQLite database on disk
+and the change log is streamed out a batch at a time. Resident memory is
+bounded by one batch plus fixed database caches — independent of how many
+accounts, aliases or changes there are — while scratch *disk* grows with the
+input. The test suite checks that an 8× larger input does not grow peak RSS
+proportionally.
+
+Run the demo (it also shows the refusal when the limit is too small for a
+cycle):
+
+```bash
+python3 demo_migrate.py                 # needs 3 ops for its alias rotations
+python3 demo_migrate.py --max-ops 3
+```
+
 ## Guarantees, and where they are tested
+
 
 | Requirement | Test file |
 |---|---|
@@ -240,6 +323,11 @@ per-group recomputation after the process restarts.
 | Per-group/category/metric sums differ correctly across groups | `test_events.py` |
 | Rollup resumes with the job and matches confirmed records; forgery refused | `test_events.py` |
 | Aggregate memory bounded by distinct keys, not by event count | `test_events.py` |
+| Alias migration: full sets, one op per account, unchanged not emitted | `test_migrate.py` |
+| Every committed batch keeps aliases unique; end state exact | `test_migrate.py` |
+| Batch size bounded; hand-over cycles share one batch or are refused | `test_migrate.py` |
+| Truncated feeds / invalid records / duplicate ids-aliases refused, nothing published | `test_migrate.py` |
+| Migration memory flat as changes grow; scratch disk cleaned up | `test_migrate.py` |
 
 ## Running the tests
 

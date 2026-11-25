@@ -66,6 +66,17 @@ class CheckpointCorrupt(JobError):
     """A recovery point or the job metadata is damaged, incomplete or foreign."""
 
 
+class MigrationError(ShipperError):
+    """An account-alias snapshot migration cannot be produced safely.
+
+    Raised for an unreadable or truncated ``FileSource`` snapshot, an invalid
+    snapshot record (bad JSON, wrong field set/type, an empty id or alias, a
+    repeated account id or alias), or a change that cannot be handed over
+    within the caller's per-batch operation limit.  When this is raised no
+    output is published and any previously successful output is untouched.
+    """
+
+
 class EventError(ShipperError):
     """A record's payload is not a valid event for the rollup.
 

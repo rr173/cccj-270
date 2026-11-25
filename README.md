@@ -78,6 +78,72 @@ while True:
 `fetch(block=True, timeout=...)` waits and wakes on any release (an
 acknowledgement, an exit, a reconnect), so no polling is needed.
 
+## Persistent jobs: recovery points that survive the process
+
+A **job** binds one session to a directory on local disk.  The
+configuration and the source identities are fixed when the job is created;
+`save()` commits a *recovery point* — one consistent cut, taken under the
+session lock, of source positions, per-group acknowledgement progress,
+unconfirmed payloads, ticket numbers, the byte ledger and the end/error
+state.  After the process exits, opening the job resumes from the last
+committed point: confirmed records are not delivered again, records still
+owed stay owed to the same group with the same tickets, and pulling
+continues from exactly the saved position.
+
+```python
+from shipper import FeedWriter, FileSource, JobStore
+
+# init: write a feed once, then create the job (fixes config + sources)
+with FeedWriter("feed.bin", max_len=64) as w:
+    w.append(1, "a", b"...")          # strictly ordered, 1..M bytes each
+job = JobStore("jobs/").create("nightly", FileSource("feed.bin"),
+                               {"a": ["A", "C"], "b": ["B"]},
+                               max_len=64, quota=256)
+
+# work: job.session is an ordinary Session — everything above applies
+rec = job.session.group("A").fetch()
+job.session.group("A").confirm(rec.ticket)
+job.save()                            # commit a recovery point
+job.close()                           # ... process exits ...
+
+# later, in another process: resume from the last committed point
+job = JobStore("jobs/").open("nightly", FileSource("feed.bin"))
+```
+
+* **Visibility** — a recovery point exists only once it is complete: the
+  file is staged, fsynced and renamed into place, and only then is `HEAD`
+  advanced.  A crash mid-save leaves the previously committed point
+  untouched and the new one invisible.
+* **Binding** — a point loads only with the job's own configuration and the
+  very sources it was created with (content-bound identity tokens plus a
+  configuration fingerprint).  Another source or another configuration is
+  refused loudly, never silently adopted.
+* **Explicit failure** — loading validates magic, length, a SHA-256 of the
+  body, the fingerprint, the identities and the state's internal
+  consistency.  Damage, incompatibility or an incomplete file raises and
+  yields no session at all, so a half-restored session can never be used;
+  earlier committed points stay openable
+  (`store.open(name, src, checkpoint=2)`).
+* **Scale** — `FileSource` reads one record at a time from disk, so the
+  stream can far exceed memory; a recovery point itself holds only the
+  unconfirmed payloads, which the quota already bounds.
+* One live handle per job at a time (an advisory file lock), so two
+  processes cannot resume — and doubly deliver — the same job.
+
+`MockSource` is resumable too (`identity()` / `open(position)`), which is
+what the tests use; `FileSource` is what crosses real process boundaries.
+
+Run the demo — every step below is a separate process:
+
+```bash
+python3 demo_persist.py init --records 30000
+python3 demo_persist.py work --count 9000      # commit, exit
+python3 demo_persist.py work --count 9000      # resume, commit, exit
+python3 demo_persist.py finish                 # drain + verify exactly-once
+python3 demo_persist.py wrong-source           # a foreign feed is refused
+```
+
+
 ## Guarantees, and where they are tested
 
 | Requirement | Test file |
@@ -95,6 +161,10 @@ acknowledgement, an exit, a reconnect), so no polling is needed.
 | Reconnect mid-session without replay or loss | `test_reconnect.py` |
 | Parallel runs equivalent to a sequential order | `test_reconnect.py`, `test_random.py` |
 | Streams far larger than memory | `test_credit.py` (`50k` records, `B=M`ish) |
+| Recovery points resume exactly; confirmed never replays, owed is kept | `test_job.py` |
+| Points bind to their config and sources; foreign ones refused | `test_job.py` |
+| Crashed saves invisible; damaged points fail; earlier points open | `test_job.py` |
+| Feed files: O(1) resume, one record in memory at a time | `test_job.py` |
 
 ## Running the tests
 

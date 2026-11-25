@@ -44,3 +44,23 @@ class UnknownGroup(ShipperError):
 
 class ProtocolError(ShipperError):
     """An acknowledgement was not the group's unacknowledged head."""
+
+
+class JobError(ShipperError):
+    """A persistent job could not be created, opened or saved."""
+
+
+class JobExists(JobError):
+    """The job name is already taken."""
+
+
+class JobNotFound(JobError):
+    """No job with that name."""
+
+
+class JobMismatch(JobError):
+    """The source or configuration does not match the recovery point."""
+
+
+class CheckpointCorrupt(JobError):
+    """A recovery point or the job metadata is damaged, incomplete or foreign."""

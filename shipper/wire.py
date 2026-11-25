@@ -24,7 +24,30 @@ from __future__ import annotations
 
 import threading
 
-from .errors import LinkDown, SourceError
+from .errors import JobMismatch, LinkDown, SourceError
+
+
+def check_position(position):
+    """Normalise a resume token to ``(consumed, last_seq)``.
+
+    A position token is ``{"consumed": n, "last_seq": s}``: how many records
+    of the stream were consumed, and the sequence number of the last one
+    (``0`` when none was).  Anything else cannot describe a recovery point,
+    so it is refused with :class:`JobMismatch`.
+    """
+    if position is None:
+        return 0, 0
+    if not isinstance(position, dict):
+        raise JobMismatch("a resume position must be a mapping, got %r"
+                          % (position,))
+    consumed = position.get("consumed")
+    last = position.get("last_seq")
+    ok = (isinstance(consumed, int) and not isinstance(consumed, bool)
+          and isinstance(last, int) and not isinstance(last, bool)
+          and consumed >= 0 and last >= 0 and (consumed > 0 or last == 0))
+    if not ok:
+        raise JobMismatch("damaged resume position: %r" % (position,))
+    return consumed, last
 
 
 class Announcement:
@@ -176,6 +199,12 @@ class SourceStore:
                 self._promise = None
 
     # -- diagnostics ------------------------------------------------------
+    def position(self):
+        """A resume token: records consumed so far, and the last record's seq."""
+        with self._lock:
+            last = self.specs[self.pos - 1].seq if self.pos else 0
+            return {"consumed": self.pos, "last_seq": last}
+
     @property
     def remaining(self):
         with self._lock:
@@ -211,6 +240,10 @@ class MemoryLink(SourceLink):
     def skip(self):
         self._usable()
         return self.store.consume(materialise=False)
+
+    def position(self):
+        """The store's resume token; see :meth:`SourceStore.position`."""
+        return self.store.position()
 
     def close(self):
         self._closed = True

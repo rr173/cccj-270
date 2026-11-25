@@ -16,9 +16,11 @@
 from __future__ import annotations
 
 import random
+import uuid
 
-from .errors import SourceError
-from .wire import Announcement, MemoryLink, Pulled, SourceLink, SourceStore, Spec
+from .errors import JobMismatch, SourceError
+from .wire import (Announcement, MemoryLink, Pulled, SourceLink, SourceStore,
+                   Spec, check_position)
 
 
 def _validate(specs, max_len):
@@ -52,6 +54,7 @@ class MockSource:
         self.specs = specs
         self.max_len = max_len
         self.store = SourceStore(specs, max_len, strict=strict)
+        self.stream_id = uuid.uuid4().hex
         self.produced = []          # seqs whose bytes were materialised
         self.on_produce = None
 
@@ -61,6 +64,32 @@ class MockSource:
 
     def link(self):
         return _ObservedLink(self)
+
+    # -- resumable-source protocol -----------------------------------------
+    def identity(self):
+        """A token naming exactly this stream, for job checkpoints."""
+        return "mock:" + self.stream_id
+
+    def open(self, position=None):
+        """A fresh link over an independent store, placed at ``position``.
+
+        The position must lie on this stream: the record just before it has
+        to be the one the recovery point names, otherwise the source refuses
+        to be taken over silently.
+        """
+        consumed, last = check_position(position)
+        if consumed > len(self.specs):
+            raise JobMismatch(
+                "position %d is beyond the end of the stream (%d records)"
+                % (consumed, len(self.specs)))
+        if consumed and self.specs[consumed - 1].seq != last:
+            raise JobMismatch(
+                "record %d of this stream is seq %d, but the recovery point "
+                "expects seq %d" % (consumed, self.specs[consumed - 1].seq,
+                                    last))
+        store = SourceStore(self.specs, self.max_len, strict=self.store.strict)
+        store.pos = consumed
+        return _ObservedLink(self, store)
 
     # -- test controls ----------------------------------------------------
     def corrupt(self, seq, *, category=None, length=None):
@@ -105,8 +134,8 @@ class MockSource:
 class _ObservedLink(MemoryLink):
     __slots__ = ("mock",)
 
-    def __init__(self, mock):
-        super().__init__(mock.store)
+    def __init__(self, mock, store=None):
+        super().__init__(mock.store if store is None else store)
         self.mock = mock
 
     def take(self):

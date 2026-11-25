@@ -75,6 +75,20 @@ class TicketIndex:
         self._max = 0
         self._live = {}            # ticket -> entry (a Behind)
 
+    @classmethod
+    def restore(cls, high_water, live):
+        """Rebuild an index from a recovery point.
+
+        ``high_water`` is the largest ticket ever issued (new tickets start
+        after it, so a number is never reused across a recovery) and ``live``
+        maps the still-outstanding tickets to their entries.
+        """
+        ti = cls()
+        ti._counter = itertools.count(high_water + 1)
+        ti._max = high_water
+        ti._live = dict(live)
+        return ti
+
     def issue(self, entry):
         """Allocate the next ticket for ``entry`` and index it."""
         t = next(self._counter)

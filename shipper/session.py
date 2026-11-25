@@ -32,8 +32,8 @@ from __future__ import annotations
 import time
 
 from .accounting import ByteLedger, TicketIndex
-from .errors import (GroupGone, LinkDown, ProtocolError, SourceError,
-                     UnknownGroup)
+from .errors import (CheckpointCorrupt, GroupGone, JobError, JobMismatch,
+                     LinkDown, ProtocolError, SourceError, UnknownGroup)
 from .hub import Hub
 from .model import Behind, Payload, Record
 from .wire import SourceLink
@@ -677,6 +677,230 @@ class Session:
     def _bump(self):
         self._epoch += 1
         self.hub.wake()
+
+    # ------------------------------------------------------------------ #
+    # Recovery points (used by shipper.job; private to the package)
+    # ------------------------------------------------------------------ #
+    def _snapshot(self):
+        """One consistent cut of the whole session, as plain data.
+
+        Runs under the session lock, so every field belongs to the same
+        instant: source positions, per-group progress, unconfirmed payloads,
+        the ticket high-water mark, the byte ledger and the end/error state.
+        Payload bytes are referenced, not copied (``bytes`` is immutable), so
+        a confirmation landing just after the snapshot cannot mutate what is
+        being saved.  Serialisation to disk is :mod:`shipper.job`'s job.
+        """
+        with self.hub.lock:
+            payloads = []
+            seen = {}
+            groups = []
+            for name in sorted(self._groups):
+                g = self._groups[name]
+                staging = []
+                for behind in g.staging:
+                    pid = seen.get(id(behind.payload))
+                    if pid is None:
+                        pid = len(payloads)
+                        seen[id(behind.payload)] = pid
+                        p = behind.payload
+                        payloads.append({"seq": p.seq, "category": p.category,
+                                         "length": p.length, "data": p.data})
+                    staging.append({"ticket": behind.ticket, "payload": pid})
+                groups.append({"name": name,
+                               "categories": sorted(g.categories),
+                               "settled_hi": g.settled_hi,
+                               "delivery": g.delivery,
+                               "gone_by": g.gone_by,
+                               "staging": staging})
+            sources = []
+            for i, s in enumerate(self._sources):
+                position = getattr(s.link, "position", None)
+                if position is None:
+                    raise JobError(
+                        "source %d uses a link that cannot report its "
+                        "position; a job's sources must be resumable" % i)
+                sources.append({"done": s.done, "error": s.error,
+                                "pulled": s.pulled, "skipped": s.skipped,
+                                "last_seq": s.last_seq,
+                                "position": position()})
+            return {
+                "max_len": self.max_len,
+                "quota": self.quota,
+                "categories": {c: list(ns)
+                               for c, ns in self._by_category.items()},
+                "finished": self._finished,
+                "error_message": self._error_message,
+                "tickets_high_water": self._tickets.high_water,
+                "ledger": {"billed": self.ledger.billed,
+                           "peak": self.ledger.peak},
+                "sources": sources,
+                "payloads": payloads,
+                "groups": groups,
+            }
+
+    def _load_snapshot(self, snap):
+        """Replace this fresh session's state with a recovery point.
+
+        All-or-nothing: everything is validated and built first, and the
+        session's state is swapped in only at the very end, so a damaged or
+        foreign recovery point can never leave a half-restored session
+        behind.  Raises :class:`JobMismatch` when the point belongs to a
+        different configuration or the sources are not where it says, and
+        :class:`CheckpointCorrupt` when it is internally inconsistent.
+        """
+        with self.hub.lock:
+            try:
+                self._restore_locked(snap)
+            except (JobMismatch, CheckpointCorrupt):
+                raise
+            except (KeyError, TypeError, IndexError, ValueError,
+                    AttributeError) as exc:
+                raise CheckpointCorrupt(
+                    "the recovery point is damaged: %r" % (exc,)) from exc
+
+    def _restore_locked(self, snap):
+        def corrupt(msg):
+            raise CheckpointCorrupt("the recovery point is damaged: " + msg)
+
+        if snap["max_len"] != self.max_len or snap["quota"] != self.quota:
+            raise JobMismatch(
+                "recovery point was made with M=%r, B=%r; this job has "
+                "M=%r, B=%r" % (snap["max_len"], snap["quota"],
+                                self.max_len, self.quota))
+        cats = {c: tuple(ns) for c, ns in snap["categories"].items()}
+        if cats != self._by_category:
+            raise JobMismatch("recovery point was made for a different "
+                              "category/group configuration")
+
+        sdocs = snap["sources"]
+        if len(sdocs) != len(self._sources):
+            raise JobMismatch("recovery point covers %d source(s); this job "
+                              "has %d" % (len(sdocs), len(self._sources)))
+        for i, (s, sd) in enumerate(zip(self._sources, sdocs)):
+            position = getattr(s.link, "position", None)
+            if position is None:
+                raise JobMismatch("source %d cannot report its position" % i)
+            if position() != sd["position"]:
+                raise JobMismatch("source %d is not at the recovery point's "
+                                  "position" % i)
+            done, error = sd["done"], sd["error"]
+            pulled, skipped, last_seq = (sd["pulled"], sd["skipped"],
+                                         sd["last_seq"])
+            if not isinstance(done, bool):
+                corrupt("source %d: bad done flag" % i)
+            if error is not None and not isinstance(error, str):
+                corrupt("source %d: bad error" % i)
+            if error is not None and not done:
+                corrupt("source %d: an error without done" % i)
+            for value in (pulled, skipped, last_seq):
+                if (not isinstance(value, int) or isinstance(value, bool)
+                        or value < 0):
+                    corrupt("source %d: bad counter" % i)
+            if pulled + skipped != sd["position"]["consumed"]:
+                corrupt("source %d: counters disagree with the position" % i)
+
+        billed = 0
+        payloads = []
+        for pd in snap["payloads"]:
+            data, length = pd["data"], pd["length"]
+            if (not isinstance(length, int) or isinstance(length, bool)
+                    or not 0 < length <= self.max_len):
+                corrupt("bad payload length %r" % (length,))
+            if not isinstance(data, (bytes, bytearray)) or len(data) != length:
+                corrupt("a staged payload's bytes are missing or mismatched")
+            p = Payload(pd["seq"], pd["category"], length, bytes(data))
+            p.billed = True
+            billed += length
+            payloads.append(p)
+        ledger = snap["ledger"]
+        if ledger["billed"] != billed:
+            corrupt("the ledger and the staged payloads disagree")
+        peak = ledger["peak"]
+        if not isinstance(peak, int) or isinstance(peak, bool) or peak < billed:
+            corrupt("bad ledger peak")
+
+        hw = snap["tickets_high_water"]
+        if not isinstance(hw, int) or isinstance(hw, bool) or hw < 0:
+            corrupt("bad ticket high-water mark")
+        groups = {}
+        live = {}
+        for gd in snap["groups"]:
+            name = gd["name"]
+            if name not in self._groups:
+                raise JobMismatch("recovery point names unknown group %r"
+                                  % (name,))
+            if name in groups:
+                corrupt("group %r appears twice" % (name,))
+            g = _GroupState(name, gd["categories"])
+            if g.categories != self._groups[name].categories:
+                raise JobMismatch("group %r has different categories"
+                                  % (name,))
+            settled_hi, delivery, gone_by = (gd["settled_hi"], gd["delivery"],
+                                             gd["gone_by"])
+            for value in (settled_hi, delivery):
+                if (not isinstance(value, int) or isinstance(value, bool)
+                        or value < 0):
+                    corrupt("group %r: bad counter" % (name,))
+            if settled_hi > hw:
+                corrupt("group %r: settled ticket beyond the high-water mark"
+                        % (name,))
+            if gone_by is not None and not isinstance(gone_by, str):
+                corrupt("group %r: bad gone marker" % (name,))
+            prev = 0
+            for st in gd["staging"]:
+                t, pid = st["ticket"], st["payload"]
+                if (not isinstance(t, int) or isinstance(t, bool)
+                        or not 1 <= t <= hw):
+                    corrupt("ticket %r is out of range" % (t,))
+                if t in live:
+                    corrupt("ticket %d was issued twice" % t)
+                if t <= prev:
+                    corrupt("group %r: staging is not in ticket order"
+                            % (name,))
+                prev = t
+                if (not isinstance(pid, int) or isinstance(pid, bool)
+                        or not 0 <= pid < len(payloads)):
+                    corrupt("group %r: bad payload reference" % (name,))
+                behind = Behind(payloads[pid], 0)
+                behind.ticket = t
+                g.staging.append(behind)
+                payloads[pid].refs += 1
+                live[t] = behind
+            g.settled_hi, g.delivery, g.gone_by = settled_hi, delivery, gone_by
+            groups[name] = g
+        if set(groups) != set(self._groups):
+            raise JobMismatch("recovery point is missing group(s)")
+        for p in payloads:
+            if p.refs == 0:
+                corrupt("a payload is owed by nobody")
+
+        fin = snap["finished"]
+        if fin not in (None, FINISH_END, FINISH_ERROR):
+            corrupt("bad finish state")
+        message = snap["error_message"]
+        if message is not None and not isinstance(message, str):
+            corrupt("bad error message")
+        if fin == FINISH_ERROR:
+            if not isinstance(message, str):
+                corrupt("error state without a message")
+            if not any(sd["error"] for sd in sdocs):
+                corrupt("error state without an errored source")
+        if fin == FINISH_END and not all(sd["done"] for sd in sdocs):
+            corrupt("end state with a live source")
+
+        # Everything checks out; swap the state in atomically.
+        self._groups = groups
+        self._tickets = TicketIndex.restore(hw, live)
+        self.ledger.billed = billed
+        self.ledger.peak = peak
+        for s, sd in zip(self._sources, sdocs):
+            s.done, s.error = sd["done"], sd["error"]
+            s.pulled, s.skipped = sd["pulled"], sd["skipped"]
+            s.last_seq = sd["last_seq"]
+        self._finished = fin
+        self._error_message = message
+        self._bump()
 
 
 def _as_link(source):

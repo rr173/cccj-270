@@ -267,6 +267,12 @@ def _decode_state(state, what):
     return out
 
 
+# Re-exported for tests and tooling that need to inspect or rebuild a single
+# recovery point while keeping the file format in one place.
+encode_checkpoint = _encode_checkpoint
+decode_checkpoint = _decode_checkpoint
+
+
 # --------------------------------------------------------------------- #
 # The job handle
 # --------------------------------------------------------------------- #
@@ -419,23 +425,29 @@ class JobStore:
         return tuple(sorted(ids))
 
     # -- creation ------------------------------------------------------------
-    def create(self, name, sources, categories, max_len, quota):
+    def create(self, name, sources, categories, max_len, quota,
+               event_window=None):
         """Create a job and open it, at a fresh initial recovery point.
 
         The configuration and the source identities are fixed here; every
         later open of this job must present matching ones.  Raises
-        :class:`JobExists` if the name is taken.
+        :class:`JobExists` if the name is taken.  ``event_window``, when set,
+        puts the session in event mode (JSON event records, time-window
+        rollups) and is part of the fixed configuration.
         """
         _check_name(name)
         srcs = _resumable_sources(sources)
         cats = _normalise_categories(categories)
         config = {"categories": cats,
                   "max_len": int(max_len),
-                  "quota": int(quota)}
+                  "quota": int(quota),
+                  "event_window": (None if event_window is None
+                                   else int(event_window))}
         links = [s.open(None) for s in srcs]
         identities = [str(s.identity()) for s in srcs]
         try:
-            session = Session(links, cats, max_len, quota)
+            session = Session(links, cats, max_len, quota,
+                              event_window=event_window)
         except Exception:
             for link in links:
                 _quiet_close(link)
@@ -525,7 +537,8 @@ class JobStore:
             cfg = meta["config"]
             try:
                 session = Session(links, cfg["categories"], cfg["max_len"],
-                                  cfg["quota"])
+                                  cfg["quota"],
+                                  event_window=cfg.get("event_window"))
                 session._load_snapshot(state)
             except Exception:
                 for link in links:

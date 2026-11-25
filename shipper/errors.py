@@ -64,3 +64,14 @@ class JobMismatch(JobError):
 
 class CheckpointCorrupt(JobError):
     """A recovery point or the job metadata is damaged, incomplete or foreign."""
+
+
+class EventError(ShipperError):
+    """A record's payload is not a valid event for the rollup.
+
+    Raised when a confirmation would settle a record whose bytes are not a
+    valid event payload (bad JSON, a missing/extra field, or a field of the
+    wrong type).  The record is *not* settled: its ticket stays live and the
+    aggregate is untouched, so a bad record can never silently corrupt a
+    group's totals.
+    """

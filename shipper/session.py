@@ -32,8 +32,10 @@ from __future__ import annotations
 import time
 
 from .accounting import ByteLedger, TicketIndex
-from .errors import (CheckpointCorrupt, GroupGone, JobError, JobMismatch,
-                     LinkDown, ProtocolError, SourceError, UnknownGroup)
+from .errors import (CheckpointCorrupt, EventError, GroupGone, JobError,
+                     JobMismatch, LinkDown, ProtocolError, SourceError,
+                     UnknownGroup)
+from .events import EventRollup, parse_event
 from .hub import Hub
 from .model import Behind, Payload, Record
 from .wire import SourceLink
@@ -168,6 +170,22 @@ class Group:
         """
         return self._session._exit(self.name)
 
+    # -- event rollup (only in event mode) --------------------------------
+    def event_windows(self, category=None, metric=None):
+        """This group's confirmed-event aggregates, sorted by window/category.
+
+        Only records this group has itself confirmed are counted.
+        """
+        return self._session.event_windows(self.name, category, metric)
+
+    def event_total(self, category=None, metric=None):
+        """The summed ``value`` of every event this group has confirmed."""
+        return self._session.event_total(self.name, category, metric)
+
+    def event_count(self):
+        """How many valid events this group has confirmed."""
+        return self._session.event_count(self.name)
+
     def __enter__(self):
         return self
 
@@ -183,11 +201,17 @@ def _view(g):
 class Session:
     """A delivery session over one or more ordered sources."""
 
-    def __init__(self, sources, categories, max_len, quota):
+    def __init__(self, sources, categories, max_len, quota,
+                 event_window=None):
         """``sources``    -- a SourceLink / SourceStore, or a list of them;
         ``categories`` -- ``{category: [group names]}`` declaring every group;
         ``max_len``    -- M, the largest record;
-        ``quota``      -- B, the shared payload quota (``B >= M``).
+        ``quota``      -- B, the shared payload quota (``B >= M``);
+        ``event_window`` -- when set to a positive integer, records are
+                          interpreted as JSON events and every confirmation
+                          folds the event into the group's time-window rollup
+                          (windows are that many UTC seconds wide).  A record
+                          that is not a valid event cannot be confirmed.
         """
         if not isinstance(sources, (list, tuple)):
             sources = [sources]
@@ -197,9 +221,17 @@ class Session:
             raise ValueError("max_len (M) must be in 1..%d" % MAX_LEN_CEILING)
         if int(quota) < int(max_len):
             raise ValueError("quota (B) must be >= max_len (M)")
+        if event_window is not None and (
+                not isinstance(event_window, int)
+                or isinstance(event_window, bool) or event_window < 1):
+            raise ValueError("event_window must be a positive integer or None")
 
         self.max_len = int(max_len)
         self.quota = int(quota)
+        self.event_window = (None if event_window is None
+                             else int(event_window))
+        self.events = (None if self.event_window is None
+                       else EventRollup(self.event_window))
         self.hub = Hub()
         self.ledger = ByteLedger(self.quota)
         self._sources = [_SourceState(_as_link(s)) for s in sources]
@@ -240,6 +272,37 @@ class Session:
     def groups(self):
         """The declared group names."""
         return tuple(sorted(self._groups))
+
+    # ------------------------------------------------------------------ #
+    # Event rollup queries (only available in event mode)
+    # ------------------------------------------------------------------ #
+    def _require_rollup(self):
+        if self.events is None:
+            raise ValueError("this session was not created with event_window")
+        return self.events
+
+    def event_windows(self, group, category=None, metric=None):
+        """The confirmed-event aggregates for one group.
+
+        Returns a tuple of :class:`~shipper.events.EventWindow` rows sorted by
+        window, then category, then metric; optional filters narrow them.  Only
+        records this group has actually confirmed are counted.
+        """
+        with self.hub.lock:
+            self._state(group)
+            return self._require_rollup().windows(group, category, metric)
+
+    def event_total(self, group, category=None, metric=None):
+        """The summed ``value`` of every event the group has confirmed."""
+        with self.hub.lock:
+            self._state(group)
+            return self._require_rollup().total(group, category, metric)
+
+    def event_count(self, group):
+        """How many valid events the group has confirmed so far."""
+        with self.hub.lock:
+            self._state(group)
+            return self._require_rollup().event_count(group)
 
     @property
     def state(self):
@@ -356,6 +419,11 @@ class Session:
                 "sources": [{"done": s.done, "error": s.error,
                              "down": s.down, "pulled": s.pulled,
                              "skipped": s.skipped} for s in self._sources],
+                "events": (None if self.events is None else {
+                    "window": self.event_window,
+                    "groups": {n: self.events.event_count(n)
+                               for n in self._groups},
+                    "keys": self.events.key_count()}),
             }
 
     def reconnect(self, link=None, source=0):
@@ -579,9 +647,17 @@ class Session:
     def _settle(self, g, behind):
         if not g.staging or g.staging[0] is not behind:
             raise AssertionError("settling a non-head record")
+        # In event mode the payload must be a valid event *before* anything is
+        # settled: a parse failure raises and leaves the record, the ticket and
+        # every total untouched, so a bad record can never be acknowledged.
+        if self.events is not None:
+            event_time, metric, value = parse_event(behind.payload.data)
         g.staging.pop(0)
         g.settled_hi = behind.ticket
         g.delivery += 1
+        if self.events is not None:
+            self.events.add(g.name, behind.payload.category,
+                            event_time, metric, value)
         self._tickets.drop(behind.ticket)
         self._release(behind.payload)
         self._bump()
@@ -737,6 +813,9 @@ class Session:
                 "sources": sources,
                 "payloads": payloads,
                 "groups": groups,
+                "event_window": self.event_window,
+                "events": (None if self.events is None
+                           else self.events.snapshot()),
             }
 
     def _load_snapshot(self, snap):
@@ -772,6 +851,10 @@ class Session:
         if cats != self._by_category:
             raise JobMismatch("recovery point was made for a different "
                               "category/group configuration")
+
+        # The rollup is parsed and cross-checked before any state is swapped,
+        # so a damaged aggregate can never leave a half-restored session.
+        rollup = self._restore_rollup_locked(snap)
 
         sdocs = snap["sources"]
         if len(sdocs) != len(self._sources):
@@ -889,6 +972,16 @@ class Session:
         if fin == FINISH_END and not all(sd["done"] for sd in sdocs):
             corrupt("end state with a live source")
 
+        # The rollup must agree with the per-group delivery counters: every
+        # confirmed record of an event-mode session folded exactly one event.
+        if rollup is not None:
+            for gd in snap["groups"]:
+                folded = rollup.event_count(gd["name"])
+                if folded != gd["delivery"]:
+                    corrupt("group %r: the rollup counts %d events but %d "
+                            "records were confirmed"
+                            % (gd["name"], folded, gd["delivery"]))
+
         # Everything checks out; swap the state in atomically.
         self._groups = groups
         self._tickets = TicketIndex.restore(hw, live)
@@ -900,7 +993,35 @@ class Session:
             s.last_seq = sd["last_seq"]
         self._finished = fin
         self._error_message = message
+        if rollup is not None:
+            self.events = rollup
         self._bump()
+
+    def _restore_rollup_locked(self, snap):
+        """Validate the rollup section against this session's event mode."""
+        doc = snap.get("events")
+        width = snap.get("event_window", "__absent__")
+        if self.events is None:
+            if doc is not None or width not in (None, "__absent__"):
+                raise JobMismatch(
+                    "the recovery point carries event aggregates but this "
+                    "job was not created in event mode")
+            return None
+        if width != self.event_window:
+            raise JobMismatch(
+                "recovery point used an event window of %r; this job uses %r"
+                % (None if width == "__absent__" else width,
+                   self.event_window))
+        if doc is None:
+            raise CheckpointCorrupt(
+                "the recovery point is missing its event rollup")
+        rollup = EventRollup.restore(doc)
+        unknown = set(rollup.groups()) - set(self._groups)
+        if unknown:
+            raise CheckpointCorrupt(
+                "the rollup names unknown group(s): %s"
+                % ", ".join(sorted(unknown)))
+        return rollup
 
 
 def _as_link(source):

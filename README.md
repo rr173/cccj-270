@@ -143,6 +143,75 @@ python3 demo_persist.py finish                 # drain + verify exactly-once
 python3 demo_persist.py wrong-source           # a foreign feed is refused
 ```
 
+## Event rollups: recoverable time-window summaries
+
+So far each statistics group could only handle one supply record at a time.
+A session created with `event_window=W` instead interprets every record's
+payload as one JSON **event**
+
+```json
+{"event_time": 1700000123, "metric": "clicks", "value": 42}
+```
+
+and keeps, per group, the running sum of `value` over fixed, left-closed /
+right-open windows of `W` UTC seconds (the demo and tests use 300).  Window
+`w` covers `[w·W, (w+1)·W)`, so `event_time=299` falls in window 0 and
+`event_time=300` in window 1; event times may arrive out of source order and
+still land in the window their timestamp belongs to.
+
+* **Only confirmed records count, per group.**  An event is folded into a
+  group's rollup at the moment *that group* confirms the record; fetching
+  never counts, another group confirming a shared record does not count it for
+  this one, and re-confirming an old ticket never double-counts.
+* **Bad payloads fail loudly and cannot be confirmed.**  Malformed JSON, a
+  non-object document, duplicate keys, a missing/extra field, or a field of
+  the wrong type (booleans and floats are not accepted as integers) raises
+  `EventError` *before* anything is settled: the ticket stays live and no
+  total changes.  The group can keep the record for inspection, or `exit()` to
+  abandon it.
+* **The summary, not the events, is what is stored.**  `EventRollup` holds one
+  running `(sum, count)` per `(window, category, metric)` key and forgets each
+  event once folded, so memory grows with the number of distinct keys — never
+  with the number of source records.  A stream far larger than memory is
+  summarised without caching its raw events.
+* **It is part of the recovery point.**  The rollup is cut under the session
+  lock inside every `save()` and validated on open, including a cross-check
+  that each group's folded-event count equals its confirmed-record count.
+  After a restart the totals are exactly those of the group's confirmed
+  records, and a damaged or forged aggregate is refused like any other
+  corrupt checkpoint.
+
+```python
+sess = Session(link, {"heat": ["A", "C"], "load": ["B"]},
+               max_len=64, quota=256, event_window=300)
+a = sess.group("A")
+rec = a.fetch()
+a.confirm(rec.ticket)          # parses the JSON event, then folds it in
+for row in a.event_windows():  # sorted by window, then category, then metric
+    print(row.window, row.category, row.metric, row.total, row.events)
+a.event_windows(category="heat", metric="clicks")   # optional filters
+a.event_total()                 # summed value over all confirmed events
+a.event_count()                 # how many events were folded
+```
+
+The same option is fixed in a persistent job's configuration and fingerprint:
+
+```python
+job = JobStore("jobs/").create("nightly", FileSource("feed.bin"),
+                               categories, 64, 256, event_window=300)
+```
+
+Run the event demos — the first in one process, the second as four:
+
+```bash
+python3 demo_events.py
+python3 demo_events_persist.py --dir demo-events run-all   # init, work, work, verify
+```
+
+`demo_events_persist.py verify` recomputes the expected windows independently
+by scanning the feed file itself, and asserts the recovered rollup equals that
+per-group recomputation after the process restarts.
+
 
 ## Guarantees, and where they are tested
 
@@ -165,6 +234,12 @@ python3 demo_persist.py wrong-source           # a foreign feed is refused
 | Points bind to their config and sources; foreign ones refused | `test_job.py` |
 | Crashed saves invisible; damaged points fail; earlier points open | `test_job.py` |
 | Feed files: O(1) resume, one record in memory at a time | `test_job.py` |
+| Strict event parsing; bad/missing/mistyped payloads cannot confirm | `test_events.py` |
+| 300s left-closed/right-open windows; out-of-order times land correctly | `test_events.py` |
+| Only per-group confirmed events count; retries don't double-count | `test_events.py` |
+| Per-group/category/metric sums differ correctly across groups | `test_events.py` |
+| Rollup resumes with the job and matches confirmed records; forgery refused | `test_events.py` |
+| Aggregate memory bounded by distinct keys, not by event count | `test_events.py` |
 
 ## Running the tests
 
